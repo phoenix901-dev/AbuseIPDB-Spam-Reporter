@@ -75,28 +75,47 @@ function abuseipdb_maybe_report_comment($comment_id) {
         return;
     }
 
-    // 3. Готовим данные для отправки.
+    // 3. Проверяем IP. Отправлять в AbuseIPDB частные и зарезервированные
+    //    адреса бессмысленно — API их отклоняет, а мы бы пометили комментарий
+    //    как "отправленный" и потеряли реальный репорт.
     $ip_address = $comment->comment_author_IP;
-    $comment_content = $comment->comment_content;
-    $url = 'https://api.abuseipdb.com/api/v2/report';
+    if (!filter_var($ip_address, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+        return;
+    }
+
+    // 4. Готовим данные для отправки.
+    //    mb_substr, а не substr: обычный substr режет UTF-8 посередине символа,
+    //    и на кириллических комментариях в JSON уходила битая строка.
+    //    Лимит AbuseIPDB на поле comment — 1024 символа, префикс занимает 24.
+    $comment_content = wp_strip_all_tags((string) $comment->comment_content);
     $body = [
         'ip' => $ip_address,
         'categories' => '10,21', // 10 = Web Spam, 21 = Web App Attack
-        'comment' => 'WordPress comment spam: ' . substr($comment_content, 0, 1000)
+        'comment' => 'WordPress comment spam: ' . mb_substr($comment_content, 0, 950, 'UTF-8')
     ];
     $headers = [
         'Accept' => 'application/json',
         'Key'    => $api_key
     ];
 
-    // 4. Отправляем асинхронный запрос.
-    wp_remote_post($url, [
-        'method'    => 'POST',
-        'headers'   => $headers,
-        'body'      => $body,
-        'timeout'   => 15,
-        'blocking'  => false // Асинхронный запрос не замедляет сайт
+    // 5. Отправляем запрос и ставим флаг ТОЛЬКО при успехе.
+    //    Раньше стояло 'blocking' => false, а флаг ставился безусловно, поэтому
+    //    единственная сетевая ошибка навсегда помечала комментарий как
+    //    отправленный, и репорт терялся безвозвратно.
+    $response = wp_remote_post('https://api.abuseipdb.com/api/v2/report', [
+        'method'   => 'POST',
+        'headers'  => $headers,
+        'body'     => $body,
+        'timeout'  => 8,
+        'blocking' => true,
     ]);
 
-    // 5. Ставим "флаг" после отправки, чтобы избежать дублей.
-    update_comment_meta($comment->comment_ID, '_abuseipdb_reported', true);
+    if (is_wp_error($response)) {
+        return;
+    }
+
+    $code = (int) wp_remote_retrieve_response_code($response);
+    if ($code >= 200 && $code < 300) {
+        update_comment_meta($comment->comment_ID, '_abuseipdb_reported', true);
+    }
+}
